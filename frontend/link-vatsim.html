@@ -315,6 +315,31 @@ function prepareRegistrationOptions(options) {
 }
 
 function credentialToJSON(value) {
+  if (value instanceof PublicKeyCredential) {
+    return {
+      id: value.id,
+      rawId: uint8ArrayToBase64Url(value.rawId),
+      type: value.type,
+      authenticatorAttachment: value.authenticatorAttachment ?? null,
+      clientExtensionResults: credentialToJSON(value.getClientExtensionResults()),
+      response: credentialToJSON(value.response),
+    };
+  }
+  if (value instanceof AuthenticatorAssertionResponse) {
+    return {
+      clientDataJSON: uint8ArrayToBase64Url(value.clientDataJSON),
+      authenticatorData: uint8ArrayToBase64Url(value.authenticatorData),
+      signature: uint8ArrayToBase64Url(value.signature),
+      userHandle: value.userHandle ? uint8ArrayToBase64Url(value.userHandle) : null,
+    };
+  }
+  if (value instanceof AuthenticatorAttestationResponse) {
+    return {
+      clientDataJSON: uint8ArrayToBase64Url(value.clientDataJSON),
+      attestationObject: uint8ArrayToBase64Url(value.attestationObject),
+      transports: typeof value.getTransports === 'function' ? value.getTransports() : [],
+    };
+  }
   if (value instanceof ArrayBuffer) return uint8ArrayToBase64Url(value);
   if (Array.isArray(value)) return value.map(credentialToJSON);
   if (value && typeof value === 'object') {
@@ -325,6 +350,17 @@ function credentialToJSON(value) {
     return converted;
   }
   return value;
+}
+
+async function parseApiResponse(response) {
+  const text = await response.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {
+      error: text || `Request failed with status ${response.status}`,
+    };
+  }
 }
 
 // Allow Enter key
@@ -355,7 +391,7 @@ async function linkVatsim() {
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({vatsim_id: cid}),
     });
-    const data = await r.json();
+    const data = await parseApiResponse(r);
     if (!r.ok) {
       showMsg('error', data.error || 'Failed to link account.');
       btn.disabled = false;
@@ -389,7 +425,7 @@ async function registerPasskey() {
       credentials: 'include',
       headers: {'Content-Type':'application/json'},
     });
-    const options = await optionsResponse.json();
+    const options = await parseApiResponse(optionsResponse);
     if (!optionsResponse.ok) {
       throw new Error(options.error || 'Failed to start passkey setup.');
     }
@@ -407,7 +443,7 @@ async function registerPasskey() {
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(credentialToJSON(credential)),
     });
-    const verifyData = await verifyResponse.json();
+    const verifyData = await parseApiResponse(verifyResponse);
     if (!verifyResponse.ok) {
       throw new Error(verifyData.error || 'Passkey setup failed.');
     }

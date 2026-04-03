@@ -82,6 +82,10 @@ def parse_json_options(options) -> dict:
     return json.loads(options_to_json(options))
 
 
+def json_error(message: str, status_code: int = 400):
+    return jsonify({"error": message}), status_code
+
+
 def get_passkey_rp_id() -> str:
     configured = os.environ.get("PASSKEY_RP_ID")
     if configured:
@@ -481,22 +485,25 @@ def passkey_register_options():
         ).fetchall()
 
     user_label = user["discord_name"] or user["discord_id"] or f"user-{user['id']}"
-    options = generate_registration_options(
-        rp_id=get_passkey_rp_id(),
-        rp_name=PASSKEY_RP_NAME,
-        user_id=str(user["id"]).encode("utf-8"),
-        user_name=user_label,
-        user_display_name=user_label,
-        authenticator_selection=AuthenticatorSelectionCriteria(
-            resident_key=ResidentKeyRequirement.REQUIRED,
-        ),
-        user_verification=UserVerificationRequirement.REQUIRED,
-        exclude_credentials=[
-            PublicKeyCredentialDescriptor(id=base64url_to_bytes(cred["credential_id"]))
-            for cred in credentials
-        ],
-    )
-    options_json = parse_json_options(options)
+    try:
+        options = generate_registration_options(
+            rp_id=get_passkey_rp_id(),
+            rp_name=PASSKEY_RP_NAME,
+            user_id=str(user["id"]).encode("utf-8"),
+            user_name=user_label,
+            user_display_name=user_label,
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                resident_key=ResidentKeyRequirement.REQUIRED,
+            ),
+            exclude_credentials=[
+                PublicKeyCredentialDescriptor(id=base64url_to_bytes(cred["credential_id"]))
+                for cred in credentials
+            ],
+        )
+        options_json = parse_json_options(options)
+    except Exception as exc:
+        return json_error(f"passkey_registration_options_failed: {exc}", 500)
+
     session["passkey_registration_challenge"] = options_json["challenge"]
     return jsonify(options_json)
 
@@ -526,7 +533,7 @@ def passkey_register_verify():
             require_user_verification=True,
         )
     except Exception as exc:
-        return jsonify({"error": f"registration_failed: {exc}"}), 400
+        return json_error(f"registration_failed: {exc}", 400)
 
     transports = credential.get("response", {}).get("transports", [])
     with get_db() as conn:
@@ -565,11 +572,15 @@ def passkey_auth_options():
     if unavailable:
         return unavailable
 
-    options = generate_authentication_options(
-        rp_id=get_passkey_rp_id(),
-        user_verification=UserVerificationRequirement.REQUIRED,
-    )
-    options_json = parse_json_options(options)
+    try:
+        options = generate_authentication_options(
+            rp_id=get_passkey_rp_id(),
+            user_verification=UserVerificationRequirement.REQUIRED,
+        )
+        options_json = parse_json_options(options)
+    except Exception as exc:
+        return json_error(f"passkey_authentication_options_failed: {exc}", 500)
+
     session["passkey_authentication_challenge"] = options_json["challenge"]
     return jsonify(options_json)
 
@@ -609,7 +620,7 @@ def passkey_auth_verify():
         ).fetchone()
 
         if not passkey:
-            return jsonify({"error": "unknown_passkey"}), 404
+            return json_error("unknown_passkey", 404)
 
         try:
             verification = verify_authentication_response(
@@ -622,7 +633,7 @@ def passkey_auth_verify():
                 require_user_verification=True,
             )
         except Exception as exc:
-            return jsonify({"error": f"authentication_failed: {exc}"}), 400
+            return json_error(f"authentication_failed: {exc}", 400)
 
         conn.execute(
             """

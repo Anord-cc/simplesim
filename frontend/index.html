@@ -348,6 +348,31 @@ function prepareAuthenticationOptions(options){
 }
 
 function credentialToJSON(value){
+  if (value instanceof PublicKeyCredential) {
+    return {
+      id: value.id,
+      rawId: uint8ArrayToBase64Url(value.rawId),
+      type: value.type,
+      authenticatorAttachment: value.authenticatorAttachment ?? null,
+      clientExtensionResults: credentialToJSON(value.getClientExtensionResults()),
+      response: credentialToJSON(value.response),
+    };
+  }
+  if (value instanceof AuthenticatorAssertionResponse) {
+    return {
+      clientDataJSON: uint8ArrayToBase64Url(value.clientDataJSON),
+      authenticatorData: uint8ArrayToBase64Url(value.authenticatorData),
+      signature: uint8ArrayToBase64Url(value.signature),
+      userHandle: value.userHandle ? uint8ArrayToBase64Url(value.userHandle) : null,
+    };
+  }
+  if (value instanceof AuthenticatorAttestationResponse) {
+    return {
+      clientDataJSON: uint8ArrayToBase64Url(value.clientDataJSON),
+      attestationObject: uint8ArrayToBase64Url(value.attestationObject),
+      transports: typeof value.getTransports === 'function' ? value.getTransports() : [],
+    };
+  }
   if (value instanceof ArrayBuffer) return uint8ArrayToBase64Url(value);
   if (Array.isArray(value)) return value.map(credentialToJSON);
   if (value && typeof value === 'object'){
