@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Alex Nord.
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# Commercial use is prohibited without written permission.
+#
+# This project is source-available for noncommercial use only.
 import base64
 import importlib
 import json
