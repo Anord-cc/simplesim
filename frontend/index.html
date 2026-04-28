@@ -216,18 +216,18 @@
   <a class="logo" href="/">HEAT<span>TRACKER</span></a>
   <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
     <a href="/roadmap" style="font-family:'Share Tech Mono',monospace;font-size:.7rem;color:var(--muted);border:1px solid var(--border);padding:.3rem .8rem;border-radius:2px;letter-spacing:.1em;text-decoration:none;transition:.2s ease">ROADMAP</a>
-    <div class="nav-pill">VATSIM INTEGRATION v2.0</div>
+    <div class="nav-pill">SIMCONNECT INTEGRATION v2.0</div>
   </div>
 </nav>
 
 <section class="hero">
   <div class="eyebrow">Flight Path Analysis</div>
   <h1>
-    <span class="accent">VATSIM</span><br>
+    <span class="accent">SIMCONNECT</span><br>
     HEAT<span class="accent">MAP</span>
     <span class="sub">Flight Tracker</span>
   </h1>
-  <p class="tagline">Visualize every mile you've flown on VATSIM. Your route history transformed into a living heatmap of the skies.</p>
+  <p class="tagline">Visualize every mile you've flown. Your route history transformed into a living heatmap of the skies.</p>
 
   <div class="auth-actions">
   <a href="/auth/login" class="btn-discord">
@@ -247,7 +247,7 @@
   <div class="feature">
     <div class="feature-icon">+</div>
     <h3>Live Tracking</h3>
-    <p>See your current position in real-time. Altitude, groundspeed, and heading all live from VATSIM data feeds.</p>
+    <p>See your current position in real-time. Altitude, groundspeed, and heading all live from SimConnect data feeds.</p>
   </div>
   <div class="feature">
     <div class="feature-icon">*</div>
@@ -430,7 +430,7 @@ async function signInWithPasskey(){
     const verifyData = await verifyResponse.json();
     if (!verifyResponse.ok) throw new Error(verifyData.error || 'Passkey login failed.');
 
-    window.location.href = verifyData.vatsim_id ? '/dashboard' : '/link-vatsim';
+    window.location.href = '/dashboard';
   } catch (error) {
     banner.textContent=error.message || 'Passkey login failed.';
     banner.style.display='block';
