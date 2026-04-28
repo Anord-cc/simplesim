@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Alex Nord.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// Commercial use is prohibited without written permission.
 using Microsoft.FlightSimulator.SimConnect;
 using System;
 using System.Diagnostics;
