@@ -4,6 +4,7 @@
 #
 # This project is source-available for noncommercial use only.
 import base64
+import hashlib
 import importlib
 import json
 import math
@@ -14,7 +15,7 @@ import threading
 import time
 from functools import wraps
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import requests
 from dotenv import load_dotenv
@@ -67,6 +68,20 @@ app = Flask(__name__, static_folder="../frontend/static", template_folder="../fr
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 CORS(app, supports_credentials=True)
 
+
+@app.after_request
+def apply_security_headers(response):
+    path = request.path or ""
+    if (
+        path == "/mcp"
+        or path.startswith("/.well-known/oauth-")
+        or path in {"/oauth/register", "/oauth/token"}
+    ):
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 # Discord OAuth config
 DISCORD_AUTH_URL = "https://discord.com/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
@@ -111,6 +126,10 @@ MAX_SEGMENT_GAP_SECONDS = 60 * 60 * 4
 MAX_SEGMENT_DISTANCE_KM = 900
 
 PASSKEY_RP_NAME = os.environ.get("PASSKEY_RP_NAME", "VATSIM HeatTracker")
+MCP_SERVER_NAME = os.environ.get("MCP_SERVER_NAME", "SimpleSim MCP")
+MCP_SERVER_VERSION = os.environ.get("MCP_SERVER_VERSION", "1.0.0")
+MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-03-26")
+MCP_READ_SCOPE = os.environ.get("MCP_READ_SCOPE", "mcp:read")
 
 _tracker_thread = None
 _tracker_lock = threading.Lock()
@@ -195,31 +214,158 @@ def safe_text(value: Any, fallback: str = "") -> str:
     return text if text else fallback
 
 
+def nested_get(payload: dict[str, Any], *path: str) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def now_unix() -> int:
+    return int(time.time())
+
+
+def normalize_origin_url(value: str) -> str:
+    parsed = urlparse(value)
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def get_public_base_url() -> str:
+    configured = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    if configured:
+        return normalize_origin_url(configured)
+
+    redirect_uri = (DISCORD_REDIRECT_URI or "").strip()
+    if redirect_uri:
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme and parsed.netloc:
+            return normalize_origin_url(f"{parsed.scheme}://{parsed.netloc}")
+
+    return normalize_origin_url(request.url_root)
+
+
+def get_mcp_server_url() -> str:
+    return f"{get_public_base_url()}/mcp"
+
+
+def get_oauth_issuer() -> str:
+    configured = (os.environ.get("MCP_OAUTH_ISSUER") or "").strip()
+    if configured:
+        return normalize_origin_url(configured)
+    return get_public_base_url()
+
+
+def build_mcp_resource_metadata_url() -> str:
+    return f"{get_public_base_url()}/.well-known/oauth-protected-resource"
+
+
+def build_oauth_metadata_url() -> str:
+    return f"{get_public_base_url()}/.well-known/oauth-authorization-server"
+
+
+def normalize_resource_uri(resource: str | None) -> str:
+    if resource:
+        return normalize_origin_url(resource)
+    return get_mcp_server_url()
+
+
+def encode_json_text_content(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(payload, separators=(",", ":"), ensure_ascii=True),
+            }
+        ]
+    }
+
+
+def sha256_base64url(value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def is_valid_redirect_uri(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme == "https":
+        return bool(parsed.netloc)
+    if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        return True
+    return False
+
+
+def parse_json_field(value: Any, default: Any):
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return default
+        return decoded
+    return value if value is not None else default
+
+
+def clean_scope(value: Any) -> str:
+    scopes = sorted({scope for scope in safe_text(value).split(" ") if scope})
+    if MCP_READ_SCOPE not in scopes:
+        scopes.append(MCP_READ_SCOPE)
+    return " ".join(scopes)
+
+
 def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("invalid_json_body")
 
-    online = safe_bool(payload.get("online"), default=True)
-    connected = safe_bool(payload.get("connected"), default=online)
+    online = safe_bool(first_present(
+        payload.get("online"),
+        payload.get("Connected to Simulator"),
+    ), default=True)
+    connected = safe_bool(first_present(
+        payload.get("connected"),
+        payload.get("Connected to Backend"),
+    ), default=online)
 
-    latitude = safe_float(
-        payload,
-        "latitude",
-        required=online,
-        minimum=-90.0,
-        maximum=90.0,
-    )
-    longitude = safe_float(
-        payload,
-        "longitude",
-        required=online,
-        minimum=-180.0,
-        maximum=180.0,
-    )
+    latitude_source = first_present(payload.get("latitude"), nested_get(payload, "position", "latitude"))
+    longitude_source = first_present(payload.get("longitude"), nested_get(payload, "position", "longitude"))
+    altitude_source = first_present(payload.get("altitude"), payload.get("altitudeMeters"))
+    groundspeed_source = first_present(payload.get("groundspeed"), payload.get("groundSpeedMetersPerSecond"))
+    heading_source = first_present(payload.get("heading"), payload.get("headingTrueDegrees"))
 
-    altitude = safe_float(payload, "altitude", required=False)
-    groundspeed = safe_float(payload, "groundspeed", required=False)
-    heading = safe_float(payload, "heading", required=False)
+    latitude = None
+    longitude = None
+    altitude = None
+    groundspeed = None
+    heading = None
+
+    if latitude_source is not None or online:
+        latitude = parse_finite_float(latitude_source, "latitude")
+        if latitude < -90.0 or latitude > 90.0:
+            raise ValueError("latitude_out_of_range")
+
+    if longitude_source is not None or online:
+        longitude = parse_finite_float(longitude_source, "longitude")
+        if longitude < -180.0 or longitude > 180.0:
+            raise ValueError("longitude_out_of_range")
+
+    if altitude_source not in (None, ""):
+        altitude = parse_finite_float(altitude_source, "altitude")
+
+    if groundspeed_source not in (None, ""):
+        groundspeed = parse_finite_float(groundspeed_source, "groundspeed")
+
+    if heading_source not in (None, ""):
+        heading = parse_finite_float(heading_source, "heading")
 
     if heading is not None:
         heading = heading % 360.0
@@ -237,7 +383,7 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
     callsign = safe_text(payload.get("callsign"), SIMCONNECT_CALLSIGN)
     source = safe_text(payload.get("source"), "simconnect-bridge")
     last_error = payload.get("last_error")
-    now_unix = int(time.time())
+    current_unix = now_unix()
 
     return {
         "online": online,
@@ -255,9 +401,10 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "source": source,
         "last_error": last_error,
+        "raw": payload,
         "received_at": utc_now_iso8601(),
-        "received_at_unix": now_unix,
-        "updated_at": now_unix,
+        "received_at_unix": current_unix,
+        "updated_at": current_unix,
     }
 
 
@@ -385,6 +532,7 @@ class SimConnectTracker:
                     "aircraft_short": SIMCONNECT_AIRCRAFT,
                 },
                 "source": state.get("source") or "simconnect-bridge",
+                "raw": state.get("raw") if isinstance(state.get("raw"), dict) else None,
             }
 
     def status(self) -> dict[str, Any]:
@@ -758,6 +906,36 @@ def get_simconnect_snapshot() -> dict[str, Any] | None:
     return simconnect_tracker.snapshot()
 
 
+def enrich_snapshot_with_simbrief(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not snapshot:
+        return None
+
+    simbrief = get_simbrief_data()
+    flight_plan = dict(snapshot.get("flight_plan") or {})
+
+    if simbrief.get("available"):
+        callsign = safe_text(simbrief.get("callsign"), snapshot.get("callsign") or SIMCONNECT_CALLSIGN)
+        departure = safe_text(simbrief.get("departure"), "")
+        arrival = safe_text(simbrief.get("arrival"), "")
+    else:
+        callsign = safe_text(snapshot.get("callsign"), SIMCONNECT_CALLSIGN)
+        departure = safe_text(flight_plan.get("departure"), "")
+        arrival = safe_text(flight_plan.get("arrival"), "")
+
+    flight_plan["departure"] = departure
+    flight_plan["arrival"] = arrival
+
+    enriched = dict(snapshot)
+    enriched["callsign"] = callsign
+    enriched["flight_plan"] = flight_plan
+    enriched["simbrief"] = simbrief
+    return enriched
+
+
+def get_live_snapshot() -> dict[str, Any] | None:
+    return enrich_snapshot_with_simbrief(get_simconnect_snapshot())
+
+
 def close_active_flight(conn: sqlite3.Connection, vatsim_id: str) -> None:
     conn.execute(
         """
@@ -790,12 +968,13 @@ def record_tracker_snapshot(conn: sqlite3.Connection, vatsim_id: str, snapshot: 
         (vatsim_id,),
     ).fetchone()
 
-    now_unix = int(time.time())
+    current_unix = now_unix()
     lat = snapshot.get("latitude")
     lng = snapshot.get("longitude")
     altitude = snapshot.get("altitude")
     groundspeed = snapshot.get("groundspeed")
     callsign = snapshot.get("callsign")
+    raw_json = json.dumps(snapshot.get("raw"), separators=(",", ":"), ensure_ascii=True) if isinstance(snapshot.get("raw"), dict) else None
 
     if latest:
         same_position = (
@@ -806,15 +985,15 @@ def record_tracker_snapshot(conn: sqlite3.Connection, vatsim_id: str, snapshot: 
             and latest["groundspeed"] == groundspeed
         )
         latest_unix = latest["recorded_unix"] or 0
-        if same_position and now_unix - latest_unix < TRACKER_MIN_INSERT_SECONDS:
+        if same_position and current_unix - latest_unix < TRACKER_MIN_INSERT_SECONDS:
             return
 
     conn.execute(
         """
-        INSERT INTO flight_points (vatsim_id, callsign, lat, lng, altitude, groundspeed)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO flight_points (vatsim_id, callsign, lat, lng, altitude, groundspeed, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (vatsim_id, callsign, lat, lng, altitude, groundspeed),
+        (vatsim_id, callsign, lat, lng, altitude, groundspeed, raw_json),
     )
 
     fp = snapshot.get("flight_plan") or {}
@@ -903,7 +1082,7 @@ def build_track_segments(rows: list[sqlite3.Row]) -> tuple[list[dict[str, Any]],
 
 
 def poll_linked_tracker_users() -> None:
-    snapshot = get_simconnect_snapshot()
+    snapshot = get_live_snapshot()
 
     with get_db() as conn:
         linked_users = conn.execute(
@@ -977,6 +1156,14 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = {row["name"] for row in rows}
+    if column_name in existing:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+
 def init_db() -> None:
     with get_db() as conn:
         conn.executescript("""
@@ -996,6 +1183,7 @@ def init_db() -> None:
                 lng         REAL NOT NULL,
                 altitude    INTEGER,
                 groundspeed INTEGER,
+                raw_json    TEXT,
                 recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -1024,10 +1212,52 @@ def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
 
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id                   TEXT PRIMARY KEY,
+                client_name                 TEXT,
+                redirect_uris               TEXT NOT NULL,
+                grant_types                 TEXT NOT NULL,
+                response_types              TEXT NOT NULL,
+                scope                       TEXT NOT NULL,
+                token_endpoint_auth_method  TEXT NOT NULL DEFAULT 'none',
+                created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
+                code                  TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                user_id               INTEGER NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                scope                 TEXT NOT NULL,
+                resource              TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                code_challenge_method TEXT NOT NULL,
+                expires_at            INTEGER NOT NULL,
+                consumed_at           INTEGER,
+                created_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+                access_token  TEXT PRIMARY KEY,
+                refresh_token TEXT UNIQUE,
+                client_id     TEXT NOT NULL,
+                user_id       INTEGER NOT NULL,
+                scope         TEXT NOT NULL,
+                resource      TEXT NOT NULL,
+                expires_at    INTEGER NOT NULL,
+                revoked_at    INTEGER,
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_points_vatsim  ON flight_points(vatsim_id);
             CREATE INDEX IF NOT EXISTS idx_flights_vatsim ON flights(vatsim_id);
             CREATE INDEX IF NOT EXISTS idx_passkeys_user  ON passkeys(user_id);
+            CREATE INDEX IF NOT EXISTS idx_oauth_codes_client ON oauth_authorization_codes(client_id);
+            CREATE INDEX IF NOT EXISTS idx_oauth_tokens_refresh ON oauth_access_tokens(refresh_token);
         """)
+        ensure_column(conn, "flight_points", "raw_json", "TEXT")
 
 
 init_db()
@@ -1061,11 +1291,309 @@ def require_linked(fn):
     return wrapper
 
 
+def load_oauth_client(client_id: str) -> dict[str, Any] | None:
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                client_id,
+                client_name,
+                redirect_uris,
+                grant_types,
+                response_types,
+                scope,
+                token_endpoint_auth_method
+            FROM oauth_clients
+            WHERE client_id = ?
+            """,
+            (client_id,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "client_id": row["client_id"],
+        "client_name": row["client_name"] or "",
+        "redirect_uris": parse_json_field(row["redirect_uris"], []),
+        "grant_types": parse_json_field(row["grant_types"], ["authorization_code", "refresh_token"]),
+        "response_types": parse_json_field(row["response_types"], ["code"]),
+        "scope": row["scope"] or MCP_READ_SCOPE,
+        "token_endpoint_auth_method": row["token_endpoint_auth_method"] or "none",
+    }
+
+
+def make_oauth_error_redirect(redirect_uri: str, error: str, state: str | None = None, description: str | None = None):
+    params = {"error": error}
+    if state:
+        params["state"] = state
+    if description:
+        params["error_description"] = description
+    separator = "&" if "?" in redirect_uri else "?"
+    return redirect(f"{redirect_uri}{separator}{urlencode(params)}")
+
+
+def issue_oauth_tokens(
+    *,
+    client_id: str,
+    user_id: int,
+    scope: str,
+    resource: str,
+) -> dict[str, Any]:
+    access_token = secrets.token_urlsafe(48)
+    refresh_token = secrets.token_urlsafe(48)
+    expires_in = 3600
+    expires_at = now_unix() + expires_in
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_access_tokens (
+                access_token, refresh_token, client_id, user_id, scope, resource, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (access_token, refresh_token, client_id, user_id, scope, resource, expires_at),
+        )
+
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+        "refresh_token": refresh_token,
+        "scope": scope,
+    }
+
+
+def verify_mcp_bearer_token() -> dict[str, Any] | None:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+
+    access_token = auth_header.split(" ", 1)[1].strip()
+    if not access_token:
+        return None
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                oauth_access_tokens.access_token,
+                oauth_access_tokens.client_id,
+                oauth_access_tokens.user_id,
+                oauth_access_tokens.scope,
+                oauth_access_tokens.resource,
+                oauth_access_tokens.expires_at,
+                oauth_access_tokens.revoked_at,
+                users.discord_id,
+                users.discord_name,
+                users.vatsim_id
+            FROM oauth_access_tokens
+            JOIN users ON users.id = oauth_access_tokens.user_id
+            WHERE oauth_access_tokens.access_token = ?
+            """,
+            (access_token,),
+        ).fetchone()
+
+    if not row or row["revoked_at"] is not None:
+        return None
+
+    if int(row["expires_at"]) <= now_unix():
+        return None
+
+    if normalize_resource_uri(row["resource"]) != normalize_resource_uri(get_mcp_server_url()):
+        return None
+
+    return dict(row)
+
+
+def mcp_unauthorized_response():
+    response = jsonify({"error": "unauthorized"})
+    response.status_code = 401
+    response.headers["WWW-Authenticate"] = (
+        f'Bearer resource_metadata="{build_mcp_resource_metadata_url()}"'
+    )
+    return response
+
+
+def jsonrpc_error_response(request_id: Any, code: int, message: str, status_code: int = 200):
+    response = jsonify({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
+    response.status_code = status_code
+    return response
+
+
+def jsonrpc_result_response(request_id: Any, result: dict[str, Any], status_code: int = 200):
+    response = jsonify({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
+    })
+    response.status_code = status_code
+    return response
+
+
+def get_mcp_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "search",
+            "description": "Search the current simulator telemetry, SimBrief flight plan, and recent tracked flights.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query.",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "fetch",
+            "description": "Fetch a full telemetry or flight document by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Document id returned by search.",
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "get_live_telemetry",
+            "description": "Return the latest live aircraft telemetry enriched with SimBrief callsign, departure, and arrival.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def build_mcp_documents_for_user(vatsim_id: str | None) -> list[dict[str, Any]]:
+    live_snapshot = get_live_snapshot()
+    simbrief = get_simbrief_data()
+    documents: list[dict[str, Any]] = []
+
+    if live_snapshot:
+        fp = live_snapshot.get("flight_plan") or {}
+        documents.append({
+            "id": "live-telemetry",
+            "title": f"Live telemetry for {safe_text(live_snapshot.get('callsign'), 'active flight')}",
+            "text": json.dumps({
+                "online": True,
+                "callsign": live_snapshot.get("callsign"),
+                "departure": fp.get("departure", ""),
+                "arrival": fp.get("arrival", ""),
+                "latitude": live_snapshot.get("latitude"),
+                "longitude": live_snapshot.get("longitude"),
+                "altitude": live_snapshot.get("altitude"),
+                "groundspeed": live_snapshot.get("groundspeed"),
+                "heading": live_snapshot.get("heading"),
+                "aircraft": fp.get("aircraft_short", ""),
+                "source": live_snapshot.get("source", "simconnect"),
+            }, indent=2),
+            "url": f"{get_public_base_url()}/api/live",
+            "metadata": {
+                "type": "telemetry",
+                "online": True,
+            },
+        })
+
+    if simbrief.get("configured"):
+        documents.append({
+            "id": "simbrief-flight-plan",
+            "title": f"Latest SimBrief OFP for {safe_text(simbrief.get('callsign'), 'configured account')}",
+            "text": json.dumps(simbrief, indent=2),
+            "url": f"{get_public_base_url()}/api/simbrief",
+            "metadata": {
+                "type": "simbrief",
+                "available": bool(simbrief.get("available")),
+            },
+        })
+
+    with get_db() as conn:
+        recent_flights = conn.execute(
+            """
+            SELECT callsign, dep, arr, aircraft, started_at, ended_at
+            FROM flights
+            WHERE vatsim_id = ?
+            ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+            LIMIT 10
+            """,
+            (vatsim_id or "",),
+        ).fetchall()
+
+    if recent_flights:
+        flights_payload = [dict(row) for row in recent_flights]
+        documents.append({
+            "id": "recent-flights",
+            "title": "Recent tracked flights",
+            "text": json.dumps({"flights": flights_payload}, indent=2),
+            "url": f"{get_public_base_url()}/api/flights",
+            "metadata": {
+                "type": "history",
+                "count": len(flights_payload),
+            },
+        })
+
+    return documents
+
+
+def perform_mcp_search(query: str, vatsim_id: str | None) -> dict[str, Any]:
+    words = {part for part in safe_text(query).lower().split() if part}
+    results: list[dict[str, Any]] = []
+
+    for document in build_mcp_documents_for_user(vatsim_id):
+        haystack = f"{document['title']} {document['text']} {json.dumps(document.get('metadata', {}))}".lower()
+        if not words or any(word in haystack for word in words):
+            results.append({
+                "id": document["id"],
+                "title": document["title"],
+                "text": document["text"][:400],
+                "url": document["url"],
+                "metadata": document.get("metadata", {}),
+            })
+
+    return {"results": results}
+
+
+def perform_mcp_fetch(document_id: str, vatsim_id: str | None) -> dict[str, Any]:
+    for document in build_mcp_documents_for_user(vatsim_id):
+        if document["id"] == document_id:
+            return {
+                "id": document["id"],
+                "title": document["title"],
+                "text": document["text"],
+                "url": document["url"],
+                "metadata": document.get("metadata", {}),
+            }
+
+    raise ValueError("unknown_document_id")
+
+
 # Discord OAuth
 @app.route("/auth/login")
 def login():
     if not is_discord_configured():
         return redirect("/?error=discord_not_configured")
+
+    next_url = request.args.get("next")
+    if next_url:
+        session["post_auth_redirect"] = next_url
 
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
@@ -1154,13 +1682,258 @@ def callback():
     session["vatsim_id"] = vatsim_id
     session["auth_method"] = "discord"
 
-    return redirect("/dashboard")
+    redirect_target = session.pop("post_auth_redirect", None) or "/dashboard"
+    return redirect(redirect_target)
 
 
 @app.route("/auth/logout")
 def logout():
     session.clear()
     return redirect("/")
+
+
+@app.route("/.well-known/oauth-protected-resource")
+def oauth_protected_resource_metadata():
+    return jsonify({
+        "resource": get_mcp_server_url(),
+        "authorization_servers": [get_oauth_issuer()],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [MCP_READ_SCOPE],
+    })
+
+
+@app.route("/.well-known/oauth-authorization-server")
+def oauth_authorization_server_metadata():
+    base_url = get_public_base_url()
+    return jsonify({
+        "issuer": get_oauth_issuer(),
+        "authorization_endpoint": f"{base_url}/oauth/authorize",
+        "token_endpoint": f"{base_url}/oauth/token",
+        "registration_endpoint": f"{base_url}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": [MCP_READ_SCOPE],
+        "response_modes_supported": ["query"],
+        "resource_parameter_supported": True,
+    })
+
+
+@app.route("/oauth/register", methods=["POST"])
+def oauth_register_client():
+    payload = request.get_json(silent=True) or {}
+    redirect_uris = payload.get("redirect_uris")
+
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        return jsonify({"error": "invalid_redirect_uris"}), 400
+
+    normalized_redirect_uris: list[str] = []
+    for redirect_uri in redirect_uris:
+        if not isinstance(redirect_uri, str) or not is_valid_redirect_uri(redirect_uri):
+            return jsonify({"error": "invalid_redirect_uri"}), 400
+        normalized_redirect_uris.append(redirect_uri)
+
+    token_endpoint_auth_method = safe_text(payload.get("token_endpoint_auth_method"), "none")
+    if token_endpoint_auth_method != "none":
+        return jsonify({"error": "unsupported_token_endpoint_auth_method"}), 400
+
+    grant_types = payload.get("grant_types")
+    if not isinstance(grant_types, list) or not grant_types:
+        grant_types = ["authorization_code", "refresh_token"]
+
+    if "authorization_code" not in grant_types:
+        return jsonify({"error": "authorization_code_required"}), 400
+
+    response_types = payload.get("response_types")
+    if not isinstance(response_types, list) or not response_types:
+        response_types = ["code"]
+
+    client_id = f"mcp-client-{secrets.token_urlsafe(18)}"
+    client_name = safe_text(payload.get("client_name"), "ChatGPT MCP Client")
+    scope = clean_scope(payload.get("scope"))
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_clients (
+                client_id, client_name, redirect_uris, grant_types, response_types, scope,
+                token_endpoint_auth_method
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                client_id,
+                client_name,
+                json.dumps(normalized_redirect_uris),
+                json.dumps(grant_types),
+                json.dumps(response_types),
+                scope,
+                token_endpoint_auth_method,
+            ),
+        )
+
+    return jsonify({
+        "client_id": client_id,
+        "client_id_issued_at": now_unix(),
+        "client_name": client_name,
+        "redirect_uris": normalized_redirect_uris,
+        "grant_types": grant_types,
+        "response_types": response_types,
+        "scope": scope,
+        "token_endpoint_auth_method": token_endpoint_auth_method,
+    }), 201
+
+
+@app.route("/oauth/authorize")
+def oauth_authorize():
+    client_id = safe_text(request.args.get("client_id"))
+    redirect_uri = safe_text(request.args.get("redirect_uri"))
+    response_type = safe_text(request.args.get("response_type"))
+    state = safe_text(request.args.get("state"))
+    scope = clean_scope(request.args.get("scope"))
+    code_challenge = safe_text(request.args.get("code_challenge"))
+    code_challenge_method = safe_text(request.args.get("code_challenge_method"), "S256")
+    resource = normalize_resource_uri(request.args.get("resource"))
+
+    client = load_oauth_client(client_id)
+    if not client:
+        return jsonify({"error": "invalid_client"}), 400
+
+    if redirect_uri not in client["redirect_uris"]:
+        return jsonify({"error": "invalid_redirect_uri"}), 400
+
+    if response_type != "code":
+        return make_oauth_error_redirect(redirect_uri, "unsupported_response_type", state)
+
+    if code_challenge_method != "S256" or not code_challenge:
+        return make_oauth_error_redirect(redirect_uri, "invalid_request", state, "PKCE S256 is required")
+
+    if resource != normalize_resource_uri(get_mcp_server_url()):
+        return make_oauth_error_redirect(redirect_uri, "invalid_target", state)
+
+    if not session.get("user_id"):
+        session["post_auth_redirect"] = request.url
+        return redirect("/auth/login")
+
+    user_id = int(session["user_id"])
+    code = secrets.token_urlsafe(32)
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_authorization_codes (
+                code, client_id, user_id, redirect_uri, scope, resource,
+                code_challenge, code_challenge_method, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code,
+                client_id,
+                user_id,
+                redirect_uri,
+                scope,
+                resource,
+                code_challenge,
+                code_challenge_method,
+                now_unix() + 600,
+            ),
+        )
+
+    params = {"code": code}
+    if state:
+        params["state"] = state
+    return redirect(f"{redirect_uri}{'&' if '?' in redirect_uri else '?'}{urlencode(params)}")
+
+
+@app.route("/oauth/token", methods=["POST"])
+def oauth_token():
+    grant_type = safe_text(request.form.get("grant_type"))
+    client_id = safe_text(request.form.get("client_id"))
+    client = load_oauth_client(client_id)
+
+    if not client:
+        return jsonify({"error": "invalid_client"}), 401
+
+    if client["token_endpoint_auth_method"] != "none":
+        return jsonify({"error": "unauthorized_client"}), 401
+
+    if grant_type == "authorization_code":
+        code = safe_text(request.form.get("code"))
+        redirect_uri = safe_text(request.form.get("redirect_uri"))
+        code_verifier = safe_text(request.form.get("code_verifier"))
+        resource = normalize_resource_uri(request.form.get("resource"))
+
+        with get_db() as conn:
+            code_row = conn.execute(
+                """
+                SELECT *
+                FROM oauth_authorization_codes
+                WHERE code = ? AND client_id = ?
+                """,
+                (code, client_id),
+            ).fetchone()
+
+            if not code_row:
+                return jsonify({"error": "invalid_grant"}), 400
+
+            if code_row["consumed_at"] is not None or int(code_row["expires_at"]) <= now_unix():
+                return jsonify({"error": "invalid_grant"}), 400
+
+            if redirect_uri != code_row["redirect_uri"]:
+                return jsonify({"error": "invalid_grant"}), 400
+
+            if resource != normalize_resource_uri(code_row["resource"]):
+                return jsonify({"error": "invalid_target"}), 400
+
+            if not code_verifier or sha256_base64url(code_verifier) != code_row["code_challenge"]:
+                return jsonify({"error": "invalid_grant"}), 400
+
+            conn.execute(
+                "UPDATE oauth_authorization_codes SET consumed_at = ? WHERE code = ?",
+                (now_unix(), code),
+            )
+
+        return jsonify(issue_oauth_tokens(
+            client_id=client_id,
+            user_id=int(code_row["user_id"]),
+            scope=code_row["scope"],
+            resource=normalize_resource_uri(code_row["resource"]),
+        ))
+
+    if grant_type == "refresh_token":
+        refresh_token = safe_text(request.form.get("refresh_token"))
+
+        with get_db() as conn:
+            token_row = conn.execute(
+                """
+                SELECT *
+                FROM oauth_access_tokens
+                WHERE refresh_token = ? AND client_id = ?
+                """,
+                (refresh_token, client_id),
+            ).fetchone()
+
+            if not token_row or token_row["revoked_at"] is not None:
+                return jsonify({"error": "invalid_grant"}), 400
+
+            if int(token_row["expires_at"]) <= now_unix():
+                return jsonify({"error": "invalid_grant"}), 400
+
+            conn.execute(
+                "UPDATE oauth_access_tokens SET revoked_at = ? WHERE refresh_token = ?",
+                (now_unix(), refresh_token),
+            )
+
+        return jsonify(issue_oauth_tokens(
+            client_id=client_id,
+            user_id=int(token_row["user_id"]),
+            scope=token_row["scope"],
+            resource=normalize_resource_uri(token_row["resource"]),
+        ))
+
+    return jsonify({"error": "unsupported_grant_type"}), 400
 
 
 # VATSIM linking
@@ -1432,6 +2205,111 @@ def telemetry():
     })
 
 
+@app.route("/mcp", methods=["POST"])
+def mcp_endpoint():
+    token_record = verify_mcp_bearer_token()
+    if not token_record:
+        return mcp_unauthorized_response()
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonrpc_error_response(None, -32700, "Parse error", 400)
+
+    request_id = payload.get("id")
+    method = safe_text(payload.get("method"))
+    params = payload.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return jsonrpc_error_response(request_id, -32602, "Invalid params", 400)
+
+    if method == "initialize":
+        protocol_version = safe_text(params.get("protocolVersion"), MCP_PROTOCOL_VERSION) or MCP_PROTOCOL_VERSION
+        return jsonrpc_result_response(request_id, {
+            "protocolVersion": protocol_version,
+            "capabilities": {
+                "tools": {
+                    "listChanged": False,
+                }
+            },
+            "serverInfo": {
+                "name": MCP_SERVER_NAME,
+                "version": MCP_SERVER_VERSION,
+            },
+            "instructions": (
+                "This MCP server exposes live simulator telemetry from SimConnect and "
+                "flight identity from SimBrief. Use get_live_telemetry for the latest status, "
+                "or search/fetch for ChatGPT-compatible read access."
+            ),
+        })
+
+    if method == "notifications/initialized":
+        return ("", 204)
+
+    if method == "ping":
+        return jsonrpc_result_response(request_id, {})
+
+    if method == "tools/list":
+        return jsonrpc_result_response(request_id, {"tools": get_mcp_tools()})
+
+    if method == "tools/call":
+        tool_name = safe_text(params.get("name"))
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return jsonrpc_error_response(request_id, -32602, "Invalid tool arguments", 400)
+
+        vatsim_id = safe_text(token_record.get("vatsim_id"))
+
+        try:
+            if tool_name == "search":
+                result = encode_json_text_content(
+                    perform_mcp_search(safe_text(arguments.get("query")), vatsim_id)
+                )
+            elif tool_name == "fetch":
+                result = encode_json_text_content(
+                    perform_mcp_fetch(safe_text(arguments.get("id")), vatsim_id)
+                )
+            elif tool_name == "get_live_telemetry":
+                snapshot = get_live_snapshot()
+                if not snapshot:
+                    result = encode_json_text_content({
+                        "online": False,
+                        "status": simconnect_tracker.status(),
+                    })
+                else:
+                    fp = snapshot.get("flight_plan") or {}
+                    result = encode_json_text_content({
+                        "online": True,
+                        "callsign": snapshot.get("callsign"),
+                        "departure": fp.get("departure", ""),
+                        "arrival": fp.get("arrival", ""),
+                        "aircraft": fp.get("aircraft_short", ""),
+                        "latitude": snapshot.get("latitude"),
+                        "longitude": snapshot.get("longitude"),
+                        "altitude": snapshot.get("altitude"),
+                        "groundspeed": snapshot.get("groundspeed"),
+                        "heading": snapshot.get("heading"),
+                        "raw": snapshot.get("raw"),
+                        "source": snapshot.get("source", "simconnect"),
+                        "simbrief": snapshot.get("simbrief", {}),
+                        "status": simconnect_tracker.status(),
+                    })
+            else:
+                return jsonrpc_error_response(request_id, -32601, "Tool not found", 404)
+        except ValueError as exc:
+            return jsonrpc_error_response(request_id, -32000, str(exc), 400)
+
+        return jsonrpc_result_response(request_id, result)
+
+    if method == "resources/list":
+        return jsonrpc_result_response(request_id, {"resources": []})
+
+    if method == "prompts/list":
+        return jsonrpc_result_response(request_id, {"prompts": []})
+
+    return jsonrpc_error_response(request_id, -32601, "Method not found", 404)
+
+
 @app.route("/api/simconnect/status")
 @require_auth
 def simconnect_status():
@@ -1443,7 +2321,7 @@ def simconnect_status():
 @require_linked
 def live_flight():
     vatsim_id = session["vatsim_id"]
-    snapshot = get_simconnect_snapshot()
+    snapshot = get_live_snapshot()
 
     if not snapshot:
         with get_db() as conn:
@@ -1470,6 +2348,7 @@ def live_flight():
         "dep": (snapshot.get("flight_plan") or {}).get("departure", ""),
         "arr": (snapshot.get("flight_plan") or {}).get("arrival", ""),
         "aircraft": (snapshot.get("flight_plan") or {}).get("aircraft_short", ""),
+        "raw": snapshot.get("raw"),
         "source": "simconnect",
         "tracker_id": vatsim_id,
         "status": simconnect_tracker.status(),
